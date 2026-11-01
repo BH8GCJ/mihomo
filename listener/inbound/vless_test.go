@@ -372,8 +372,9 @@ func TestInboundVless_Reality(t *testing.T) {
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
 	t.Run("X25519MLKEM768", func(t *testing.T) {
+		supportMLKEM := true
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		outboundOptions.RealityOpts.SupportX25519MLKEM768 = &supportMLKEM
 		testInboundVless(t, inboundOptions, outboundOptions)
 		t.Run("xtls-rprx-vision", func(t *testing.T) {
 			outboundOptions := outboundOptions
@@ -406,8 +407,9 @@ func TestInboundVless_Reality_Grpc(t *testing.T) {
 	}
 	testInboundVless(t, inboundOptions, outboundOptions)
 	t.Run("X25519MLKEM768", func(t *testing.T) {
+		supportMLKEM := true
 		outboundOptions := outboundOptions
-		outboundOptions.RealityOpts.SupportX25519MLKEM768 = true
+		outboundOptions.RealityOpts.SupportX25519MLKEM768 = &supportMLKEM
 		testInboundVless(t, inboundOptions, outboundOptions)
 	})
 }

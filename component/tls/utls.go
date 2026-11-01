@@ -2,6 +2,7 @@ package tls
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"reflect"
 	"unsafe"
@@ -303,6 +304,67 @@ func BuildRemovedX25519MLKEM768HandshakeState(c *UConn) error {
 		return err
 	}
 	return nil
+}
+
+// BuildAddedX25519MLKEM768HandshakeState adds the X25519MLKEM768 hybrid key share
+// to the ClientHello when the fingerprint spec does not already include it.
+//
+// Xray-core >= v26.9.8 (XTLS/reality 8cdf7bf9c) rejects a REALITY ClientHello that
+// does not carry an X25519MLKEM768 key share before the optional plain X25519 share.
+// Classical uTLS fingerprints (e.g. HelloFirefox_120, HelloSafari_16_0) predate
+// ML-KEM and therefore cannot authenticate against such servers.
+//
+// The UConn must be created with utls.HelloCustom so that BuildHandshakeState does
+// not re-apply the original, ML-KEM-less preset spec. The curve and key share are
+// inserted before any plain X25519 entry because xtls/reality parses key shares in
+// order. Key share data is intentionally left empty: ApplyPreset generates the
+// hybrid key pair and populates HandshakeState.State13.KeyShareKeys.
+func BuildAddedX25519MLKEM768HandshakeState(c *UConn, fingerprint UClientHelloID) error {
+	spec, err := utls.UTLSIdToSpec(fingerprint)
+	if err != nil {
+		return err
+	}
+
+	var hasKeyShare bool
+	for _, extension := range spec.Extensions {
+		if curves, ok := extension.(*utls.SupportedCurvesExtension); ok {
+			if !slices.Contains(curves.Curves, utls.X25519MLKEM768) {
+				curves.Curves = append([]utls.CurveID{utls.X25519MLKEM768}, curves.Curves...)
+			}
+		}
+		if keyShares, ok := extension.(*utls.KeyShareExtension); ok {
+			hasKeyShare = true
+			mlkemIndex, x25519Index := -1, -1
+			for i, share := range keyShares.KeyShares {
+				if share.Group == utls.X25519MLKEM768 && mlkemIndex == -1 {
+					mlkemIndex = i
+				}
+				if share.Group == utls.X25519 && x25519Index == -1 {
+					x25519Index = i
+				}
+			}
+			switch {
+			case mlkemIndex == -1:
+				// Prepend so X25519MLKEM768 precedes any plain X25519 key share.
+				// Data is left empty: ApplyPreset generates the hybrid key pair.
+				keyShares.KeyShares = append([]utls.KeyShare{{Group: utls.X25519MLKEM768}}, keyShares.KeyShares...)
+			case x25519Index != -1 && mlkemIndex > x25519Index:
+				// The server stops at the first plain X25519 share, so move a
+				// pre-existing ML-KEM share in front of it.
+				mlkem := keyShares.KeyShares[mlkemIndex]
+				keyShares.KeyShares = append(keyShares.KeyShares[:mlkemIndex], keyShares.KeyShares[mlkemIndex+1:]...)
+				keyShares.KeyShares = append([]utls.KeyShare{mlkem}, keyShares.KeyShares...)
+			}
+		}
+	}
+	if !hasKeyShare {
+		return fmt.Errorf("fingerprint %s %s has no TLS 1.3 key share extension, REALITY cannot use it", fingerprint.Client, fingerprint.Version)
+	}
+
+	if err := c.ApplyPreset(&spec); err != nil {
+		return err
+	}
+	return c.BuildHandshakeState()
 }
 
 func GetTLSConnectionState(conn net.Conn) (tlsState tls.ConnectionState) {

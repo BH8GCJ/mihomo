@@ -26,13 +26,38 @@ import (
 	"golang.org/x/crypto/hkdf"
 )
 
-const RealityMaxShortIDLen = 8
+const (
+	RealityMaxShortIDLen = 8
+
+	// REALITY ClientHello session ID layout (same as Xray-core):
+	//   [0:3] client version, [3] reserved, [4:8] Unix timestamp, [8:16] short ID.
+	// Xray-core v26.7.11 .. v26.9.7 defaulted minClientVer to 26.3.27, so clients
+	// that still advertise the old 1.8.2 version are rejected as well.
+	realityClientVersionX byte = 26
+	realityClientVersionY byte = 3
+	realityClientVersionZ byte = 27
+)
 
 type RealityConfig struct {
 	PublicKey *ecdh.PublicKey
 	ShortID   [RealityMaxShortIDLen]byte
 
 	SupportX25519MLKEM768 bool
+}
+
+// buildRealitySessionID assembles the 32-byte ClientHello session ID that
+// REALITY uses to carry the client version, timestamp and short ID. The layout
+// must match Xray-core's server parser (plainText[0:3] version, [3] reserved,
+// [4:8] big-endian Unix timestamp, [8:16] short ID).
+func buildRealitySessionID(shortID [RealityMaxShortIDLen]byte, unixTime int64) [32]byte {
+	var sessionID [32]byte
+	sessionID[0] = realityClientVersionX
+	sessionID[1] = realityClientVersionY
+	sessionID[2] = realityClientVersionZ
+	sessionID[3] = 0 // reserved
+	binary.BigEndian.PutUint32(sessionID[4:8], uint32(unixTime))
+	copy(sessionID[8:], shortID[:])
+	return sessionID
 }
 
 func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHelloID, serverName string, realityConfig *RealityConfig) (net.Conn, error) {
@@ -48,32 +73,43 @@ func GetRealityConn(ctx context.Context, conn net.Conn, fingerprint UClientHello
 			VerifyConnection:       verifier.VerifyConnection,
 		}
 
-		uConn := utls.UClient(conn, uConfig, fingerprint)
+		// Xray-core >= v26.9.8 requires X25519MLKEM768 in the ClientHello. uTLS
+		// generates key share data only inside ApplyPreset, which must run before
+		// the hello is built, so use HelloCustom and apply the augmented spec.
+		// Random/randomized fingerprints have no static spec; keep the old path.
+		helloID := fingerprint
+		addMLKEM := realityConfig.SupportX25519MLKEM768
+		if addMLKEM {
+			if _, err := utls.UTLSIdToSpec(fingerprint); err != nil {
+				addMLKEM = false
+				log.Warnln("REALITY: fingerprint %s has no static ClientHello spec, X25519MLKEM768 cannot be added", fingerprint.Client)
+			} else {
+				helloID = utls.HelloCustom
+			}
+		}
+		uConn := utls.UClient(conn, uConfig, helloID)
 		verifier.UConn = uConn
-		err := uConn.BuildHandshakeState()
+
+		var err error
+		switch {
+		case addMLKEM:
+			err = BuildAddedX25519MLKEM768HandshakeState(uConn, fingerprint)
+		case realityConfig.SupportX25519MLKEM768:
+			err = uConn.BuildHandshakeState()
+		default: // old REALITY server that does not support X25519MLKEM768
+			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
+		}
 		if err != nil {
 			return nil, err
 		}
 
-		if !realityConfig.SupportX25519MLKEM768 { // for X25519MLKEM768 does not work properly with the old reality server
-			err = BuildRemovedX25519MLKEM768HandshakeState(uConn)
-			if err != nil {
-				return nil, err
-			}
-		}
-
 		hello := uConn.HandshakeState.Hello
-		rawSessionID := hello.Raw[39 : 39+32] // the location of session ID
-		for i := range rawSessionID {         // https://github.com/golang/go/issues/5373
-			rawSessionID[i] = 0
-		}
-
-		binary.BigEndian.PutUint64(hello.SessionId, uint64(ntp.Now().Unix()))
-
-		copy(hello.SessionId[8:], realityConfig.ShortID[:])
-		hello.SessionId[0] = 1
-		hello.SessionId[1] = 8
-		hello.SessionId[2] = 2
+		// The REALITY AEAD authenticates the ClientHello with the session ID
+		// field zeroed (the server zeros it before Open), so clear the raw field
+		// first and only copy the sealed session ID in after sealing.
+		copy(hello.Raw[39:], make([]byte, 32)) // the fixed location of session ID
+		sessionID := buildRealitySessionID(realityConfig.ShortID, ntp.Now().Unix())
+		hello.SessionId = sessionID[:]
 
 		//log.Debugln("REALITY hello.sessionId[:16]: %v", hello.SessionId[:16])
 
